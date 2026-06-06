@@ -60,8 +60,45 @@ Model auto-downloads on first run. For offline use, place `sharp_2572gikvuh.pt` 
 - **Load SHARP Model** - (down)Load the SHARP model
 - **SHARP Predict** - Generate 3D Gaussians from a single image
 - **Load Image with EXIF** - Load image and auto-extract focal length from EXIF (35mm equivalent)
+- **Estimate Cameras from Images** - Estimate or import cameras for a multi-image batch
+- **Merge Gaussians** - Concatenate world-space PLY files produced from a batch
 
 Images with EXIF data get focal length auto-calculated when using the Load Image with EXIF node.
+
+## Multi-image room workflow
+
+An example is available in [`workflows/multi_image_room.json`](workflows/multi_image_room.json):
+
+```text
+3x Load Image -> Image Batch -> Estimate Cameras from Images
+              -> SHARP Predict -> Merge Gaussians -> merged room PLY
+```
+
+`Estimate Cameras from Images` returns the image batch unchanged, OpenCV
+world-to-camera extrinsics `[N,4,4]`, pixel intrinsics `[N,4,4]`, and a JSON
+description containing each camera position and orientation. Connect both camera
+outputs to `SHARP Predict`. This is required to unproject every per-image SHARP
+result into one world coordinate system before merging.
+
+`SharpPredict` writes to the ComfyUI temp directory by default. Set its
+`save_folder_ply` input to an existing directory to use a custom destination.
+The output with the same name returns the directory containing the generated
+PLY file or files.
+
+The default `vggt` method is optional and intentionally is not installed by the
+base package:
+
+```bash
+python -m pip install "git+https://github.com/facebookresearch/vggt.git"
+```
+
+Run the command with the Python environment that executes the ComfyUI-Sharp
+nodes. The `facebook/VGGT-1B` weights are downloaded on first use and stored in
+`ComfyUI/models/vggt/`.
+
+For camera poses produced elsewhere, select the dependency-free `json` method.
+See [`docs/multi_image_cameras.md`](docs/multi_image_cameras.md) for the JSON
+schema, coordinate convention, normalization behavior, and limitations.
 
 ## Community
 

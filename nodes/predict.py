@@ -14,12 +14,12 @@ from comfy_api.latest import io
 
 log = logging.getLogger("sharp")
 
-# Try to import ComfyUI folder_paths for output directory
+# Try to import ComfyUI folder_paths for temporary output directory
 try:
     import folder_paths
-    OUTPUT_DIR = folder_paths.get_output_directory()
+    TEMP_DIR = folder_paths.get_temp_directory()
 except ImportError:
-    OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
+    TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp")
 
 from .utils.image import comfy_to_numpy_rgb, convert_focallength
 
@@ -50,6 +50,39 @@ def _compute_image_hash(image_np: np.ndarray) -> str:
     return hashlib.sha256(image_np.tobytes()).hexdigest()[:16]
 
 
+def _resolve_save_folder(save_folder_ply: str) -> str:
+    """Resolve and validate the base folder used for PLY output."""
+    requested_folder = (save_folder_ply or "").strip()
+    if not requested_folder:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        return os.path.abspath(TEMP_DIR)
+
+    resolved_folder = os.path.abspath(
+        os.path.expandvars(os.path.expanduser(requested_folder))
+    )
+    if not os.path.exists(resolved_folder):
+        raise ValueError(f"save_folder_ply does not exist: {resolved_folder}")
+    if not os.path.isdir(resolved_folder):
+        raise ValueError(f"save_folder_ply is not a directory: {resolved_folder}")
+    return resolved_folder
+
+
+def _build_output_destination(
+    output_base: str,
+    output_prefix: str,
+    batch_size: int,
+    timestamp: int,
+) -> tuple[str, str, bool]:
+    """Return the PLY output path and the folder that contains this run."""
+    if batch_size == 1:
+        output_path = os.path.join(output_base, f"{output_prefix}_{timestamp}.ply")
+        return output_path, output_base, False
+
+    output_folder = os.path.join(output_base, f"{output_prefix}_{timestamp}")
+    os.makedirs(output_folder, exist_ok=True)
+    return output_folder, output_folder, True
+
+
 class SharpPredict(io.ComfyNode):
     """Run SHARP inference to generate 3D Gaussians from a single image or batch."""
 
@@ -70,14 +103,17 @@ class SharpPredict(io.ComfyNode):
                 io.String.Input("output_prefix", default="sharp", optional=True,
                                 tooltip="Prefix for output PLY filename or folder name for batches."),
                 io.Custom("EXTRINSICS").Input("extrinsics", optional=True,
-                                             tooltip="Camera extrinsics (from SamplePanorama). If batched, must match image batch size."),
+                                             tooltip="OpenCV world-to-camera extrinsics. If batched, must match image batch size."),
                 io.Custom("INTRINSICS").Input("intrinsics", optional=True,
-                                             tooltip="Camera intrinsics (from SamplePanorama). Overrides focal_length_mm if provided."),
+                                             tooltip="Pixel camera intrinsics. Shared or batched; overrides focal_length_mm."),
+                io.String.Input("save_folder_ply", default="", optional=True,
+                                tooltip="Existing base folder for PLY files. Empty uses the ComfyUI temp folder."),
             ],
             outputs=[
                 io.String.Output(display_name="ply_path"),
                 io.Custom("EXTRINSICS").Output(display_name="extrinsics"),
                 io.Custom("INTRINSICS").Output(display_name="intrinsics"),
+                io.String.Output(display_name="save_folder_ply"),
             ],
         )
 
@@ -91,6 +127,7 @@ class SharpPredict(io.ComfyNode):
         output_prefix: str = "sharp",
         extrinsics: torch.Tensor = None,
         intrinsics: torch.Tensor = None,
+        save_folder_ply: str = "",
     ):
         """Run SHARP inference and save PLY file(s).
 
@@ -99,7 +136,7 @@ class SharpPredict(io.ComfyNode):
 
         Features are cached per image - changing focal_length with same image is instant.
 
-        If extrinsics/intrinsics are provided (from SamplePanorama), Gaussians are
+        If extrinsics/intrinsics are provided, Gaussians are
         unprojected into world coordinates using those camera parameters.
         """
         import comfy.model_management
@@ -125,27 +162,29 @@ class SharpPredict(io.ComfyNode):
                 extrinsics = extrinsics.unsqueeze(0)
             if extrinsics.shape[0] != batch_size:
                 raise ValueError(f"Extrinsics batch size ({extrinsics.shape[0]}) must match image batch size ({batch_size})")
-            log.info(f"Processing {batch_size} image(s) with provided camera parameters (panorama mode)")
+            if intrinsics.dim() == 2:
+                intrinsics = intrinsics.unsqueeze(0).expand(batch_size, -1, -1)
+            elif intrinsics.dim() != 3:
+                raise ValueError(
+                    f"Intrinsics must have shape [4,4] or [N,4,4], got {tuple(intrinsics.shape)}"
+                )
+            if intrinsics.shape[0] != batch_size:
+                raise ValueError(
+                    f"Intrinsics batch size ({intrinsics.shape[0]}) must match image batch size ({batch_size})"
+                )
+            log.info(f"Processing {batch_size} image(s) with provided camera parameters")
         else:
             log.info(f"Processing {batch_size} image(s)")
 
-        # Ensure output directory exists
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        output_base = _resolve_save_folder(save_folder_ply)
         timestamp = int(time.time() * 1000)
 
-        # Determine output path(s)
-        if batch_size == 1:
-            # Single image: save directly as PLY file
-            output_filename = f"{output_prefix}_{timestamp}.ply"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
-            is_batch = False
-        else:
-            # Multiple images: create folder
-            folder_name = f"{output_prefix}_{timestamp}"
-            output_folder = os.path.join(OUTPUT_DIR, folder_name)
-            os.makedirs(output_folder, exist_ok=True)
-            output_path = output_folder
-            is_batch = True
+        output_path, output_folder, is_batch = _build_output_destination(
+            output_base,
+            output_prefix,
+            batch_size,
+            timestamp,
+        )
 
         all_ply_paths = []
         all_extrinsics = []
@@ -167,7 +206,7 @@ class SharpPredict(io.ComfyNode):
             # Get camera parameters for this image
             if has_camera_params:
                 # Use provided intrinsics (extract focal length)
-                img_intrinsics = intrinsics.to(device)
+                img_intrinsics = intrinsics[i].to(device)
                 img_extrinsics = extrinsics[i].to(device)
                 f_px = img_intrinsics[0, 0].item()  # fx from intrinsics matrix
             else:
@@ -207,14 +246,22 @@ class SharpPredict(io.ComfyNode):
         inference_time = time.time() - inference_start
         log.info(f"Total inference time: {inference_time:.2f}s ({inference_time/batch_size:.2f}s per image)")
 
-        # Return values
-        if is_batch:
-            # For batch: return folder path, and first image's camera params
-            # (assuming all images have same camera - user can override)
-            return io.NodeOutput(output_path, all_extrinsics[0], all_intrinsics[0])
+        if has_camera_params:
+            output_extrinsics = extrinsics.detach().cpu()
+            output_intrinsics = intrinsics.detach().cpu()
+            if not is_batch:
+                output_extrinsics = output_extrinsics[0]
+                output_intrinsics = output_intrinsics[0]
         else:
-            # For single image: return PLY path and camera params
-            return io.NodeOutput(output_path, all_extrinsics[0], all_intrinsics[0])
+            output_extrinsics = all_extrinsics[0]
+            output_intrinsics = all_intrinsics[0]
+
+        return io.NodeOutput(
+            output_path,
+            output_extrinsics,
+            output_intrinsics,
+            output_folder,
+        )
 
 
 def _predict_image_cached(
