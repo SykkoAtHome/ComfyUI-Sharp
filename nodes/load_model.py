@@ -7,6 +7,7 @@ on-demand in _load_sharp_model(), called by inference nodes.
 
 import os
 import logging
+import inspect
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -38,6 +39,18 @@ def _comfy_tqdm():
                 holder["pbar"].update_absolute(holder["done"], holder["total"])
             return ret
     return _T
+
+
+def _download_sharp_checkpoint():
+    """Download the checkpoint using options supported by huggingface_hub."""
+    download_kwargs = {
+        "repo_id": SHARP_REPO_ID,
+        "filename": SHARP_FILENAME,
+        "local_dir": MODELS_DIR,
+    }
+    if "tqdm_class" in inspect.signature(hf_hub_download).parameters:
+        download_kwargs["tqdm_class"] = _comfy_tqdm()
+    return hf_hub_download(**download_kwargs)
 
 
 # Try to get ComfyUI models directory
@@ -186,12 +199,7 @@ class LoadSharpModel(io.ComfyNode):
 
         # Download checkpoint if needed
         os.makedirs(MODELS_DIR, exist_ok=True)
-        model_path = hf_hub_download(
-            repo_id=SHARP_REPO_ID,
-            filename=SHARP_FILENAME,
-            local_dir=MODELS_DIR,
-            tqdm_class=_comfy_tqdm(),
-        )
+        model_path = _download_sharp_checkpoint()
 
         log.info(f"SHARP config: precision={precision} -> dtype={dtype_str}, path={model_path}")
 
