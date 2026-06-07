@@ -14,6 +14,8 @@ from comfy_api.latest import io
 
 log = logging.getLogger("sharp")
 
+INTERNAL_SHAPE = (1536, 1536)
+
 # Try to import ComfyUI folder_paths for temporary output directory
 try:
     import folder_paths
@@ -115,6 +117,7 @@ class SharpPredict(io.ComfyNode):
                 io.Custom("INTRINSICS").Output(display_name="intrinsics"),
                 io.String.Output(display_name="save_folder_ply"),
             ],
+            hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
@@ -142,7 +145,7 @@ class SharpPredict(io.ComfyNode):
         import comfy.model_management
         import comfy.utils
         from .load_model import _load_sharp_model
-        from .sharp.gaussians import save_ply, unproject_gaussians
+        from .sharp.gaussians import save_ply
 
         # model is a config dict from LoadSharpModel — load on-demand
         patcher = _load_sharp_model(model)
@@ -186,15 +189,49 @@ class SharpPredict(io.ComfyNode):
             timestamp,
         )
 
-        all_ply_paths = []
         all_extrinsics = []
         all_intrinsics = []
 
         inference_start = time.time()
-        pbar = comfy.utils.ProgressBar(batch_size)
+        progress_per_image = 100
+        progress_total = batch_size * progress_per_image
+        pbar = comfy.utils.ProgressBar(
+            progress_total,
+            node_id=cls.hidden.unique_id,
+        )
+
+        def set_status(text: str):
+            if cls.hidden.unique_id:
+                from server import PromptServer
+                PromptServer.instance.send_progress_text(text, cls.hidden.unique_id)
+
+        # Keep the model resident for the whole batch. Loading it from the
+        # ModelPatcher for every image adds repeated VRAM-management overhead.
+        input_shape = [1, 3, INTERNAL_SHAPE[0], INTERNAL_SHAPE[1]]
+        memory_required = patcher.memory_required(input_shape)
+        comfy.model_management.load_models_gpu(
+            [patcher],
+            memory_required=memory_required,
+        )
 
         for i in range(batch_size):
             comfy.model_management.throw_exception_if_processing_interrupted()
+            progress_base = i * progress_per_image
+            set_status(f"Image {i + 1}/{batch_size}: encoding")
+
+            spn_encoder = predictor.monodepth_model.monodepth_predictor.encoder
+            spn_encoder.progress_callback = lambda value, total, base=progress_base: (
+                pbar.update_absolute(base + 70 * value / total)
+            )
+
+            def inference_progress(stage: str, base=progress_base):
+                if stage == "encode_complete":
+                    pbar.update_absolute(base + 70)
+                    set_status(f"Image {i + 1}/{batch_size}: decoding")
+                elif stage == "decode_complete":
+                    pbar.update_absolute(base + 90)
+                    set_status(f"Image {i + 1}/{batch_size}: saving PLY")
+
             # Extract single image from batch
             single_image = image[i:i+1]
             image_np = comfy_to_numpy_rgb(single_image)
@@ -220,11 +257,17 @@ class SharpPredict(io.ComfyNode):
 
             # Run inference with caching
             log.info(f"Running inference on image {i+1}/{batch_size}...")
-            gaussians = _predict_image_cached(
-                patcher, predictor, image_np, f_px, device,
-                extrinsics=img_extrinsics,
-                intrinsics=img_intrinsics,
-            )
+            try:
+                gaussians = _predict_image_cached(
+                    patcher, predictor, image_np, f_px, device,
+                    extrinsics=img_extrinsics,
+                    intrinsics=img_intrinsics,
+                    use_encode_cache=(batch_size == 1),
+                    ensure_model_loaded=False,
+                    progress_callback=inference_progress,
+                )
+            finally:
+                spn_encoder.progress_callback = None
 
             # Determine output filename
             if is_batch:
@@ -236,15 +279,17 @@ class SharpPredict(io.ComfyNode):
             # Save PLY and get metadata
             _, metadata = save_ply(gaussians, f_px, (height, width), Path(ply_path))
 
-            all_ply_paths.append(ply_path)
             all_extrinsics.append(metadata["extrinsic"])
             all_intrinsics.append(metadata["intrinsic"])
 
             log.info(f"Saved: {ply_path} ({metadata['num_gaussians']:,} gaussians)")
-            pbar.update(1)
+            pbar.update_absolute(progress_base + progress_per_image)
 
         inference_time = time.time() - inference_start
         log.info(f"Total inference time: {inference_time:.2f}s ({inference_time/batch_size:.2f}s per image)")
+        set_status(
+            f"Done: {batch_size} image(s), {inference_time:.1f}s total"
+        )
 
         if has_camera_params:
             output_extrinsics = extrinsics.detach().cpu()
@@ -272,6 +317,9 @@ def _predict_image_cached(
     device: torch.device,
     extrinsics: torch.Tensor = None,
     intrinsics: torch.Tensor = None,
+    use_encode_cache: bool = True,
+    ensure_model_loaded: bool = True,
+    progress_callback=None,
 ):
     """Predict Gaussians with caching of encoded features.
 
@@ -286,24 +334,33 @@ def _predict_image_cached(
         device: Torch device
         extrinsics: Optional 4x4 camera extrinsics (world-to-camera)
         intrinsics: Optional 4x4 camera intrinsics
+        use_encode_cache: Cache encoded features on CPU for a later invocation.
+            Disable for multi-image runs because each image immediately evicts
+            the previous entry.
+        ensure_model_loaded: Load the ModelPatcher before inference. Batch
+            callers can do this once before their loop.
+        progress_callback: Optional callback receiving encode/decode stage names.
     """
     global _encode_cache
     import comfy.model_management
     from .sharp.gaussians import unproject_gaussians
 
-    internal_shape = (1536, 1536)
-
-    # Load to GPU with dynamic memory budget based on input shape
-    input_shape = [1, 3, internal_shape[0], internal_shape[1]]
-    memory_required = patcher.memory_required(input_shape)
-    comfy.model_management.load_models_gpu([patcher], memory_required=memory_required)
+    # Load to GPU with dynamic memory budget based on input shape.
+    if ensure_model_loaded:
+        input_shape = [1, 3, INTERNAL_SHAPE[0], INTERNAL_SHAPE[1]]
+        memory_required = patcher.memory_required(input_shape)
+        comfy.model_management.load_models_gpu(
+            [patcher],
+            memory_required=memory_required,
+        )
     height, width = image.shape[:2]
 
-    # Compute image hash for cache
-    image_hash = _compute_image_hash(image)
+    # A batch contains different images, while this cache holds only one entry.
+    # Avoid hashing and GPU-to-CPU feature copies when the entry cannot be reused.
+    image_hash = _compute_image_hash(image) if use_encode_cache else None
 
     # Check cache
-    if _encode_cache["image_hash"] == image_hash:
+    if use_encode_cache and _encode_cache["image_hash"] == image_hash:
         # Cache hit - reuse encoded features
         log.info("Cache hit - reusing encoded features (focal_length change is instant)")
         monodepth_output = _monodepth_to(_encode_cache["monodepth_output"], device)
@@ -312,11 +369,12 @@ def _predict_image_cached(
         # Cache miss - need to encode
         log.info("Encoding...")
 
-        # Clear old cache
-        _encode_cache["image_hash"] = None
-        _encode_cache["monodepth_output"] = None
-        _encode_cache["image_resized"] = None
-        _encode_cache["original_shape"] = None
+        if use_encode_cache:
+            # Clear old cache before allocating the replacement.
+            _encode_cache["image_hash"] = None
+            _encode_cache["monodepth_output"] = None
+            _encode_cache["image_resized"] = None
+            _encode_cache["original_shape"] = None
 
         # Convert to tensor and normalize
         image_pt = torch.from_numpy(image.copy()).float().to(device).permute(2, 0, 1) / 255.0
@@ -324,7 +382,7 @@ def _predict_image_cached(
         # Resize to internal resolution
         image_resized_pt = F.interpolate(
             image_pt[None],
-            size=(internal_shape[1], internal_shape[0]),
+            size=(INTERNAL_SHAPE[1], INTERNAL_SHAPE[0]),
             mode="bilinear",
             align_corners=True,
         )
@@ -334,21 +392,32 @@ def _predict_image_cached(
         monodepth_output, _ = predictor.encode(image_resized_pt)
         log.info(f"Encode time: {time.time() - encode_start:.2f}s")
 
-        # Update cache (store on CPU to free VRAM)
-        _encode_cache["image_hash"] = image_hash
-        _encode_cache["monodepth_output"] = _monodepth_to(monodepth_output, "cpu")
-        _encode_cache["image_resized"] = image_resized_pt.cpu()
-        _encode_cache["original_shape"] = (height, width)
+        if use_encode_cache:
+            # Store on CPU so changing camera parameters can reuse the expensive
+            # encoder output without permanently consuming VRAM.
+            _encode_cache["image_hash"] = image_hash
+            _encode_cache["monodepth_output"] = _monodepth_to(monodepth_output, "cpu")
+            _encode_cache["image_resized"] = image_resized_pt.cpu()
+            _encode_cache["original_shape"] = (height, width)
 
         # Release fragmented GPU memory after heavy encode (35 ViT passes)
         comfy.model_management.soft_empty_cache()
+
+    if progress_callback is not None:
+        progress_callback("encode_complete")
 
     # Decode - always run with current focal length
     disparity_factor = torch.tensor([f_px / width]).float().to(device)
 
     decode_start = time.time()
-    gaussians_ndc = predictor.decode(monodepth_output, image_resized_pt, disparity_factor)
+    gaussians_ndc = predictor.decode(
+        monodepth_output,
+        image_resized_pt,
+        disparity_factor,
+    )
     log.info(f"Decode time: {time.time() - decode_start:.2f}s")
+    if progress_callback is not None:
+        progress_callback("decode_complete")
 
     # Build intrinsics for unprojection (use provided or construct from f_px)
     if intrinsics is not None:
@@ -369,8 +438,8 @@ def _predict_image_cached(
 
     # Scale intrinsics to internal resolution
     intrinsics_resized = unproj_intrinsics.clone()
-    intrinsics_resized[0] *= internal_shape[0] / width
-    intrinsics_resized[1] *= internal_shape[1] / height
+    intrinsics_resized[0] *= INTERNAL_SHAPE[0] / width
+    intrinsics_resized[1] *= INTERNAL_SHAPE[1] / height
 
     # Use provided extrinsics or identity
     if extrinsics is not None:
@@ -380,7 +449,7 @@ def _predict_image_cached(
 
     # Convert Gaussians to world/metric space
     gaussians = unproject_gaussians(
-        gaussians_ndc, unproj_extrinsics, intrinsics_resized, internal_shape
+        gaussians_ndc, unproj_extrinsics, intrinsics_resized, INTERNAL_SHAPE
     )
 
     return gaussians

@@ -660,6 +660,9 @@ class SlidingPyramidNetwork(nn.Module):
         # Process first chunk to discover output shapes, then pre-allocate
         first_end = min(chunk_size, N)
         first_enc, first_inter = self.patch_encoder(x_pyramid_patches[:first_end])
+        progress_callback = getattr(self, "progress_callback", None)
+        if progress_callback is not None:
+            progress_callback(first_end, N)
 
         x_pyramid_encodings = torch.empty(
             N, *first_enc.shape[1:], device=first_enc.device, dtype=first_enc.dtype,
@@ -688,6 +691,8 @@ class SlidingPyramidNetwork(nn.Module):
             for layer_id, feat in inter.items():
                 patch_intermediate_features[layer_id][i:end] = feat
             del inter
+            if progress_callback is not None:
+                progress_callback(end, N)
         del x_pyramid_patches
         # Release cached CUDA blocks from ViT forward passes
         comfy.model_management.soft_empty_cache()
